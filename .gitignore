@@ -5,3 +5,5 @@ data/
 .env
 .playwright/
 test-results/
+node_modules/
+artifacts/
