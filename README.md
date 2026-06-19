@@ -28,3 +28,13 @@ Open http://127.0.0.1:8844/
 ```bash
 pytest -q
 ```
+
+## Congress.gov ingestion
+
+Live federal ingestion is implemented through `civics_app.congress.CongressGovClient` and the admin endpoint:
+
+```bash
+curl -X POST 'http://127.0.0.1:8844/api/admin/sync-congress?limit=25'
+```
+
+The Congress.gov API requires a key. On the production host, put it in `/etc/civics.env` as `CONGRESS_API_KEY=...` and restart `civics-api.service`. The scheduled unit `civics-congress-sync.timer` runs the sync periodically; when the key is missing it records a `missing_api_key` ingestion run without failing the service.

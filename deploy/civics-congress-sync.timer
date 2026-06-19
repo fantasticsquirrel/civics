@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Civics Congress.gov sync every 2 hours
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=2h
+Persistent=true
+Unit=civics-congress-sync.service
+
+[Install]
+WantedBy=timers.target

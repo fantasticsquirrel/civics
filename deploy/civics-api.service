@@ -1,0 +1,16 @@
+[Unit]
+Description=Civics Radar FastAPI app
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/civics
+EnvironmentFile=-/etc/civics.env
+Environment=CIVICS_DB=/opt/civics/data/civics.db
+ExecStart=/opt/civics/.venv/bin/python -m uvicorn civics_app.main:app --host 127.0.0.1 --port 8844
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import contextmanager
+
+from civics_app.congress import CongressGovClient, normalize_congress_bill
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -137,6 +139,17 @@ def init_db() -> None:
                 delivered_at TEXT,
                 UNIQUE(user_id, match_id, channel)
             );
+            CREATE TABLE IF NOT EXISTS ingestion_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                requested_limit INTEGER NOT NULL DEFAULT 0,
+                bills_seen INTEGER NOT NULL DEFAULT 0,
+                bills_upserted INTEGER NOT NULL DEFAULT 0,
+                message TEXT NOT NULL DEFAULT '',
+                started_at TEXT NOT NULL,
+                completed_at TEXT
+            );
             """
         )
 
@@ -244,6 +257,10 @@ class InterestIn(BaseModel):
     min_severity: str = "low"
 
 
+class CongressSampleSyncIn(BaseModel):
+    bills: list[dict[str, Any]]
+
+
 class AuditProvider:
     name = "base"
 
@@ -311,25 +328,76 @@ def seed_defaults() -> dict[str, int]:
         return {"categories": len(DEFAULT_CATEGORIES), "demo_user": 1}
 
 
-def sync_demo_bills() -> int:
+def upsert_bills(bills: list[dict[str, Any]]) -> int:
     seed_defaults()
     with connect() as db:
-        for b in DEMO_BILLS:
-            db.execute(
+        upserted = 0
+        for b in bills:
+            cur = db.execute(
                 """
                 INSERT INTO bills(canonical_key,jurisdiction_kind,jurisdiction_code,session,chamber,bill_number,title,summary,status,source_name,source_url,text_url,introduced_at,updated_at,text_hash)
                 VALUES (:canonical_key,:jurisdiction_kind,:jurisdiction_code,:session,:chamber,:bill_number,:title,:summary,:status,:source_name,:source_url,:text_url,:introduced_at,:updated_at,:text_hash)
                 ON CONFLICT(canonical_key) DO UPDATE SET
                     title=excluded.title, summary=excluded.summary, status=excluded.status,
-                    source_url=excluded.source_url, text_url=excluded.text_url, updated_at=excluded.updated_at, text_hash=excluded.text_hash
+                    chamber=excluded.chamber, source_url=excluded.source_url, text_url=excluded.text_url,
+                    updated_at=excluded.updated_at, text_hash=excluded.text_hash
                 """,
                 b,
             )
-        return len(DEMO_BILLS)
+            # SQLite reports 1 for insert and update; this is useful as touched/upserted count.
+            upserted += max(cur.rowcount, 0)
+        return upserted
 
 
-def run_audits() -> dict[str, int]:
-    sync_demo_bills()
+def sync_demo_bills() -> int:
+    return upsert_bills(DEMO_BILLS)
+
+
+def record_ingestion_run(source_name: str, status: str, requested_limit: int, bills_seen: int = 0, bills_upserted: int = 0, message: str = "") -> dict[str, Any]:
+    init_db()
+    with connect() as db:
+        cur = db.execute(
+            """
+            INSERT INTO ingestion_runs(source_name,status,requested_limit,bills_seen,bills_upserted,message,started_at,completed_at)
+            VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (source_name, status, requested_limit, bills_seen, bills_upserted, message, utcnow(), utcnow()),
+        )
+        row = db.execute("SELECT * FROM ingestion_runs WHERE id=?", (cur.lastrowid,)).fetchone()
+        return dict(row)
+
+
+def sync_congress_bills(limit: int = 20) -> dict[str, Any]:
+    seed_defaults()
+    client = CongressGovClient()
+    if not client.ready:
+        status = client.status()
+        run = record_ingestion_run("Congress.gov", status["status"], limit, message=status["message"])
+        return {**status, "ingestion_run": run}
+    try:
+        raw_bills = client.fetch_recent_bills(limit=limit)
+        normalized = [normalize_congress_bill(item) for item in raw_bills]
+        upserted = upsert_bills(normalized)
+        run = record_ingestion_run("Congress.gov", "completed", limit, len(raw_bills), upserted, "")
+        audit_result = run_audits(seed_demo=False)
+        match_result = generate_matches(seed_demo=False)
+        return {
+            "ok": True,
+            "status": "completed",
+            "bills_seen": len(raw_bills),
+            "bills_upserted": upserted,
+            "ingestion_run": run,
+            **audit_result,
+            **match_result,
+        }
+    except Exception as exc:
+        run = record_ingestion_run("Congress.gov", "failed", limit, message=str(exc))
+        return {"ok": False, "status": "failed", "message": str(exc), "ingestion_run": run}
+
+
+def run_audits(seed_demo: bool = True) -> dict[str, int]:
+    if seed_demo:
+        sync_demo_bills()
     provider = KeywordAuditor()
     with connect() as db:
         bills = db.execute("SELECT * FROM bills ORDER BY id").fetchall()
@@ -371,8 +439,8 @@ def run_audits() -> dict[str, int]:
         return {"audit_runs_created": created, "flags_created": flags}
 
 
-def generate_matches() -> dict[str, int]:
-    run_audits()
+def generate_matches(seed_demo: bool = True) -> dict[str, int]:
+    run_audits(seed_demo=seed_demo)
     created_matches = 0
     created_notifications = 0
     with connect() as db:
@@ -471,6 +539,28 @@ def create_category(category: CategoryIn) -> dict[str, Any]:
 @app.post("/api/admin/sync-demo-bills")
 def api_sync_demo_bills() -> dict[str, Any]:
     return {"ok": True, "bills_upserted": sync_demo_bills()}
+
+
+@app.post("/api/admin/sync-congress")
+def api_sync_congress(limit: int = Query(default=20, ge=1, le=250)) -> dict[str, Any]:
+    return sync_congress_bills(limit=limit)
+
+
+@app.post("/api/admin/sync-congress-sample")
+def api_sync_congress_sample(payload: CongressSampleSyncIn) -> dict[str, Any]:
+    normalized = [normalize_congress_bill(item) for item in payload.bills]
+    upserted = upsert_bills(normalized)
+    run = record_ingestion_run("Congress.gov", "sample_completed", len(payload.bills), len(payload.bills), upserted, "sample fixture sync")
+    audit_result = run_audits(seed_demo=False)
+    match_result = generate_matches(seed_demo=False)
+    return {"ok": True, "bills_upserted": upserted, "ingestion_run": run, **audit_result, **match_result}
+
+
+@app.get("/api/admin/ingestion-runs")
+def api_ingestion_runs() -> list[dict[str, Any]]:
+    init_db()
+    with connect() as db:
+        return rows_to_dicts(db.execute("SELECT * FROM ingestion_runs ORDER BY id DESC LIMIT 25").fetchall())
 
 
 @app.post("/api/admin/run-audits")
