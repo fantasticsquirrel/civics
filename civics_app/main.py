@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, Field
 
 APP_TITLE = "Civics Radar"
@@ -601,6 +601,11 @@ def representative_links(jurisdiction_code: str) -> list[dict[str, str]]:
 @app.get("/api/representatives/links")
 def api_representative_links(jurisdiction: str = "US") -> list[dict[str, str]]:
     return representative_links(jurisdiction.upper())
+
+
+@app.get("/favicon.ico")
+def favicon() -> Response:
+    return Response(status_code=204)
 
 
 @app.get("/", response_class=HTMLResponse)
