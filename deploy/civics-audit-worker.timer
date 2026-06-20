@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Civics audit worker every 10 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+Persistent=true
+Unit=civics-audit-worker.service
+
+[Install]
+WantedBy=timers.target

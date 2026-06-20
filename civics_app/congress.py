@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -108,9 +110,11 @@ def normalize_congress_bill(item: dict[str, Any]) -> dict[str, str]:
 class CongressGovClient:
     base_url = "https://api.congress.gov/v3"
 
-    def __init__(self, api_key: str | None = None, timeout: int = 30):
+    def __init__(self, api_key: str | None = None, timeout: int = 30, retries: int = 2, backoff_seconds: float = 1.0):
         self.api_key = api_key or os.environ.get("CONGRESS_API_KEY")
         self.timeout = timeout
+        self.retries = max(1, int(retries))
+        self.backoff_seconds = max(0.0, float(backoff_seconds))
 
     @property
     def ready(self) -> bool:
@@ -133,9 +137,18 @@ class CongressGovClient:
         )
         url = f"{self.base_url}/bill?{query}"
         req = urllib.request.Request(url, headers={"User-Agent": "CivicsRadar/0.1"})
-        with urllib.request.urlopen(req, timeout=self.timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        bills = payload.get("bills")
-        if not isinstance(bills, list):
-            raise RuntimeError("Congress.gov response did not include a bills list")
-        return bills
+        last_exc: BaseException | None = None
+        for attempt in range(1, self.retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                bills = payload.get("bills")
+                if not isinstance(bills, list):
+                    raise RuntimeError("Congress.gov response did not include a bills list")
+                return bills
+            except (TimeoutError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+                last_exc = exc
+                if attempt >= self.retries:
+                    break
+                time.sleep(self.backoff_seconds * attempt)
+        raise RuntimeError(str(last_exc) if last_exc else "Congress.gov request failed")

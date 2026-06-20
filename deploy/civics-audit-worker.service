@@ -1,0 +1,12 @@
+[Unit]
+Description=Process queued Civics bill audit jobs
+After=network-online.target civics-api.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/civics
+EnvironmentFile=-/etc/civics.env
+Environment=CIVICS_DB=/opt/civics/data/civics.db
+ExecStart=/opt/civics/.venv/bin/python -m civics_app.sync_audits --limit 50
+User=root
