@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Civics LegiScan sync every two hours
+
+[Timer]
+OnBootSec=7min
+OnUnitActiveSec=2h
+Persistent=true
+Unit=civics-legiscan-sync.service
+
+[Install]
+WantedBy=timers.target

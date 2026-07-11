@@ -1,73 +1,97 @@
-import os
-from pathlib import Path
-
 import pytest
 from fastapi.testclient import TestClient
 
+from civics_app.db import connect
+from civics_app.main import DEMO_BILLS, app, process_audit_jobs, upsert_bills
+
 
 @pytest.fixture()
-def client(tmp_path, monkeypatch):
-    monkeypatch.setenv("CIVICS_DB", str(tmp_path / "civics-test.db"))
-    from civics_app.main import app
-
-    return TestClient(app)
-
-
-def test_pipeline_audits_each_bill_once_and_fans_out_matches(client):
-    assert client.post("/api/admin/seed").status_code == 200
-    assert client.post("/api/admin/sync-demo-bills").json()["bills_upserted"] == 3
-
-    first_audit = client.post("/api/admin/run-audits").json()
-    assert first_audit["audit_runs_created"] == 3
-    assert first_audit["flags_created"] == 15
-
-    second_audit = client.post("/api/admin/run-audits").json()
-    assert second_audit["audit_runs_created"] == 0
-    assert second_audit["flags_created"] == 0
-
-    matches = client.post("/api/admin/generate-matches").json()
-    assert matches["matches_created"] >= 3
-    assert matches["notifications_created"] >= 3
-
-    dashboard = client.get("/api/dashboard").json()
-    assert {m["category_slug"] for m in dashboard["matches"]} >= {"education", "healthcare", "housing"}
-    assert len(dashboard["notifications"]) == len(dashboard["matches"])
+def api(tmp_path, monkeypatch):
+    monkeypatch.setenv("CIVICS_DB", str(tmp_path / "civics.db"))
+    monkeypatch.setenv("CIVICS_BOOTSTRAP_ADMIN_TOKEN", "test-bootstrap-secret-at-least-32-bytes")
+    client = TestClient(app, backend_options={"use_uvloop": True})
+    system = {"Authorization": "Bearer test-bootstrap-secret-at-least-32-bytes"}
+    client.post("/api/admin/seed", headers=system)
+    created = client.post("/api/admin/accounts", headers=system,
+                          json={"account_name": "Watch Org", "email": "watch@example.com", "role": "admin"}).json()
+    user = {"Authorization": f"Bearer {created['api_token']}"}
+    return client, system, user
 
 
-def test_category_creation_and_interest_selection(client):
-    client.post("/api/admin/seed")
-    response = client.post(
-        "/api/admin/categories",
-        json={
-            "slug": "energy",
-            "name": "Energy & Utilities",
-            "description": "Energy generation, utilities, grid reliability, and rates.",
-            "examples_positive": "energy, utility, grid, electricity",
-        },
-    )
+def test_pipeline_is_idempotent_and_feed_is_tenant_scoped(api):
+    client, _, user = api
+    assert client.post("/api/admin/sync-demo-bills", headers=user).json()["bills_upserted"] == 3
+    first = client.post("/api/admin/run-audits", headers=user).json()
+    second = client.post("/api/admin/run-audits", headers=user).json()
+    assert first["audit_runs_created"] == 3
+    assert second["audit_runs_created"] == 0
+    assert client.get("/api/dashboard", headers=user).json()["user"]["email"] == "watch@example.com"
+
+
+def test_categories_interests_and_bill_provenance(api):
+    client, _, user = api
+    response = client.post("/api/admin/categories", headers=user, json={
+        "slug": "energy", "name": "Energy & Utilities",
+        "description": "Energy generation and grid reliability.", "examples_positive": "energy, grid"})
     assert response.status_code == 200
-    assert response.json()["slug"] == "energy"
+    assert client.post("/api/interests", headers=user, json={
+        "category_slugs": ["energy", "healthcare"], "min_severity": "medium", "jurisdictions": ["US", "MO"]
+    }).json()["active_interests"] == 2
+    client.post("/api/admin/sync-demo-bills", headers=user)
+    client.post("/api/admin/run-audits", headers=user)
+    client.post("/api/admin/generate-matches", headers=user)
+    bills = client.get("/api/bills?page_size=2&sort=title&order=asc", headers=user).json()
+    assert bills["total"] == 3 and len(bills["items"]) == 2
+    detail = client.get(f"/api/bills/{bills['items'][0]['id']}", headers=user).json()
+    assert detail["official_sources"]["record"].startswith("https://")
+    assert detail["audit_disclaimer"] and detail["audit_runs"]
+    assert detail["audit_runs"][0]["provider"] == "keyword-deterministic"
 
-    interests = client.post(
-        "/api/interests",
-        json={"email": "demo@example.com", "category_slugs": ["energy", "healthcare"], "min_severity": "medium"},
-    )
-    assert interests.status_code == 200
-    assert interests.json()["active_interests"] == 2
 
-    dashboard = client.get("/api/dashboard").json()
-    active = {i["slug"] for i in dashboard["interests"]}
-    assert active == {"energy", "healthcare"}
+def test_ui_is_accessible_multi_view_shell(api):
+    client, _, _ = api
+    html = client.get("/").text
+    for label in ("Feed", "Bills", "Alerts", "Saved Views", "Settings", "Admin"):
+        assert label in html
+    assert 'href="#content"' in html and 'aria-label="Primary"' in html
 
 
-def test_bill_detail_exposes_audit_citations_and_representative_links(client):
-    client.post("/api/admin/generate-matches")
-    bills = client.get("/api/bills").json()
-    assert bills
+def test_audits_use_the_immutable_bill_version_snapshot(api):
+    _, _, _ = api
+    first = {**DEMO_BILLS[0], "canonical_key": "us-version-test", "text_hash": "version-one",
+             "title": "School Support Act", "summary": "Provides school grants."}
+    second = {**first, "text_hash": "version-two", "title": "Road Maintenance Act",
+              "summary": "Repairs highways and bridges."}
+    upsert_bills([first])
+    upsert_bills([second])
+    process_audit_jobs(limit=100, generate_after=False)
+    with connect() as db:
+        states = [row[0] for row in db.execute("""
+            SELECT af.flag_state FROM audit_flags af
+            JOIN audit_runs ar ON ar.id=af.audit_run_id
+            JOIN bill_versions bv ON bv.id=ar.bill_version_id
+            JOIN categories c ON c.id=af.category_id
+            JOIN bills b ON b.id=ar.bill_id
+            WHERE b.canonical_key='us-version-test' AND c.slug='education'
+            ORDER BY bv.id
+        """).fetchall()]
+    assert states == ["yes", "no"]
 
-    detail = client.get(f"/api/bills/{bills[0]['id']}").json()
-    assert detail["bill"]["source_url"].startswith("https://")
-    assert detail["flags"]
-    assert all("citation" in flag for flag in detail["flags"])
-    labels = {link["label"] for link in detail["representative_links"]}
-    assert "USA.gov: find elected officials" in labels
+
+def test_taxonomy_changes_supersede_old_jobs_and_queue_latest_versions(api):
+    client, _, admin = api
+    client.post("/api/admin/sync-demo-bills", headers=admin)
+    created = client.post("/api/admin/categories", headers=admin, json={
+        "slug": "water", "name": "Water", "description": "Water systems and quality.",
+        "examples_positive": "water, utility",
+    }).json()
+    deactivated = client.patch(
+        f"/api/admin/categories/{created['id']}", headers=admin, json={"active": False},
+    ).json()
+    assert created["taxonomy_version"] != deactivated["taxonomy_version"]
+    with connect() as db:
+        statuses = {row[0]: row[1] for row in db.execute(
+            "SELECT status,COUNT(*) FROM audit_jobs GROUP BY status"
+        ).fetchall()}
+    assert statuses["superseded"] >= 3
+    assert statuses["queued"] == 3

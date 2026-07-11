@@ -1,22 +1,22 @@
 [Unit]
-Description=Sync recent federal bills from Congress.gov into Civics Radar
-After=network-online.target civics-api.service
-Wants=network-online.target
+Description=Back up the Civics Radar SQLite database
+After=civics-api.service
 
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/civics
 EnvironmentFile=-/etc/civics.env
 Environment=CIVICS_DB=/opt/civics/data/civics.db
-ExecStart=/opt/civics/.venv/bin/python -m civics_app.sync_congress --limit 25
+Environment=CIVICS_BACKUP_DIR=/opt/civics/backups
+ExecStart=/opt/civics/scripts/backup_civics_db.sh
 User=civics
 Group=civics
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
-PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
+PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -24,6 +24,6 @@ RestrictSUIDSGID=true
 RestrictNamespaces=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
-ReadWritePaths=/opt/civics/data
+ReadWritePaths=/opt/civics/data /opt/civics/backups
 CapabilityBoundingSet=
 AmbientCapabilities=

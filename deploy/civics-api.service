@@ -1,6 +1,7 @@
 [Unit]
 Description=Civics Radar FastAPI app
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -10,7 +11,24 @@ Environment=CIVICS_DB=/opt/civics/data/civics.db
 ExecStart=/opt/civics/.venv/bin/python -m uvicorn civics_app.main:app --host 127.0.0.1 --port 8844
 Restart=always
 RestartSec=5
-User=root
+User=civics
+Group=civics
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=/opt/civics/data
+CapabilityBoundingSet=
+AmbientCapabilities=
 
 [Install]
 WantedBy=multi-user.target

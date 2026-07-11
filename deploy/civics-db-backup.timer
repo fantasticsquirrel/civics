@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up Civics Radar daily
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30m
+Persistent=true
+Unit=civics-db-backup.service
+
+[Install]
+WantedBy=timers.target

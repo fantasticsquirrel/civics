@@ -1,5 +1,5 @@
 [Unit]
-Description=Sync recent federal bills from Congress.gov into Civics Radar
+Description=Deliver queued Civics Radar notifications
 After=network-online.target civics-api.service
 Wants=network-online.target
 
@@ -8,15 +8,15 @@ Type=oneshot
 WorkingDirectory=/opt/civics
 EnvironmentFile=-/etc/civics.env
 Environment=CIVICS_DB=/opt/civics/data/civics.db
-ExecStart=/opt/civics/.venv/bin/python -m civics_app.sync_congress --limit 25
+ExecStart=/opt/civics/.venv/bin/python -m civics_app.sync_notifications --limit 100
 User=civics
 Group=civics
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
-PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
+PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

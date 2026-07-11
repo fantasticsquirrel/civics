@@ -1,0 +1,4 @@
+-- civics_app.db.init_db rebuilds audit_runs for existing databases so the
+-- uniqueness constraint is bill-version scoped while preserving row IDs.
+-- New installations use:
+-- UNIQUE(bill_version_id, taxonomy_version, prompt_version)

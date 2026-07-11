@@ -11,6 +11,19 @@ from dataclasses import dataclass
 from typing import Any
 
 
+def _redact_api_keys(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: ("[redacted]" if key.lower() in {"api_key", "apikey", "key"} else _redact_api_keys(item))
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_api_keys(item) for item in value]
+    if isinstance(value, str) and "api_key=" in value:
+        parts = urllib.parse.urlsplit(value)
+        query = [(key, "[redacted]" if key.lower() == "api_key" else item) for key, item in urllib.parse.parse_qsl(parts.query)]
+        return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, urllib.parse.urlencode(query), parts.fragment))
+    return value
+
+
 @dataclass(frozen=True)
 class CongressBill:
     canonical_key: str
@@ -68,7 +81,13 @@ def congress_public_url(congress: int | str, bill_type: str, number: str) -> str
     return f"https://www.congress.gov/bill/{_ordinal_congress(congress)}/{_bill_type_slug(bill_type)}/{number}"
 
 
-def normalize_congress_bill(item: dict[str, Any]) -> dict[str, str]:
+def _safe_https_url(value: Any, fallback: str) -> str:
+    candidate = str(value or "")
+    parts = urllib.parse.urlsplit(candidate)
+    return candidate if parts.scheme == "https" and bool(parts.netloc) else fallback
+
+
+def normalize_congress_bill(item: dict[str, Any]) -> dict[str, Any]:
     congress = str(item.get("congress") or "")
     bill_type = str(item.get("type") or "").lower()
     number = str(item.get("number") or "")
@@ -100,10 +119,11 @@ def normalize_congress_bill(item: dict[str, Any]) -> dict[str, str]:
         "status": status,
         "source_name": "Congress.gov",
         "source_url": public_url,
-        "text_url": api_url,
+        "text_url": _safe_https_url(item.get("text_url") or api_url, public_url),
         "introduced_at": introduced_at,
         "updated_at": updated_at,
         "text_hash": text_hash,
+        "raw_payload": item,
     }
 
 
@@ -129,26 +149,60 @@ class CongressGovClient:
             }
         return {"ok": True, "status": "ready"}
 
-    def fetch_recent_bills(self, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
+    def _get_json(self, url: str) -> dict[str, Any]:
         if not self.ready:
             raise RuntimeError("missing_api_key")
-        query = urllib.parse.urlencode(
-            {"format": "json", "limit": max(1, min(int(limit), 250)), "offset": max(0, int(offset)), "api_key": self.api_key}
-        )
-        url = f"{self.base_url}/bill?{query}"
+        separator = "&" if "?" in url else "?"
+        url = f"{url}{separator}{urllib.parse.urlencode({'format': 'json', 'api_key': self.api_key})}"
         req = urllib.request.Request(url, headers={"User-Agent": "CivicsRadar/0.1"})
         last_exc: BaseException | None = None
         for attempt in range(1, self.retries + 1):
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout) as response:
                     payload = json.loads(response.read().decode("utf-8"))
-                bills = payload.get("bills")
-                if not isinstance(bills, list):
-                    raise RuntimeError("Congress.gov response did not include a bills list")
-                return bills
+                if not isinstance(payload, dict):
+                    raise RuntimeError("Congress.gov response was not an object")
+                return payload
             except (TimeoutError, urllib.error.URLError, urllib.error.HTTPError) as exc:
                 last_exc = exc
                 if attempt >= self.retries:
                     break
                 time.sleep(self.backoff_seconds * attempt)
-        raise RuntimeError(str(last_exc) if last_exc else "Congress.gov request failed")
+        detail = type(last_exc).__name__ if last_exc else "unknown error"
+        raise RuntimeError(f"Congress.gov request failed: {detail}")
+
+    def fetch_recent_bills(self, limit: int = 20, offset: int = 0, enrich: bool = False) -> list[dict[str, Any]]:
+        query = urllib.parse.urlencode({"limit": max(1, min(int(limit), 250)), "offset": max(0, int(offset))})
+        payload = self._get_json(f"{self.base_url}/bill?{query}")
+        bills = payload.get("bills")
+        if not isinstance(bills, list):
+            raise RuntimeError("Congress.gov response did not include a bills list")
+        return [self.enrich_bill(item) for item in bills] if enrich else bills
+
+    def enrich_bill(self, item: dict[str, Any]) -> dict[str, Any]:
+        congress, bill_type, number = item.get("congress"), str(item.get("type") or "").lower(), item.get("number")
+        if not congress or not bill_type or not number:
+            return item
+        root = f"{self.base_url}/bill/{congress}/{bill_type}/{number}"
+        enriched = dict(item)
+        payloads: dict[str, Any] = {"list_item": item}
+        for name, suffix in (("detail", ""), ("summaries", "/summaries"), ("text", "/text"), ("actions", "/actions")):
+            try:
+                payloads[name] = self._get_json(root + suffix)
+            except RuntimeError:
+                payloads[name] = {}
+        if isinstance(payloads["detail"].get("bill"), dict):
+            enriched.update(payloads["detail"]["bill"])
+        summaries = payloads["summaries"].get("summaries") or []
+        if summaries:
+            enriched["summary"] = str(summaries[0].get("text") or enriched.get("summary") or enriched.get("title") or "")
+        versions = payloads["text"].get("textVersions") or []
+        for version in versions:
+            formats = version.get("formats") or []
+            preferred = next((fmt for kind in ("Formatted Text", "PDF", "Formatted XML") for fmt in formats if fmt.get("type") == kind), None)
+            if preferred and preferred.get("url"):
+                enriched["text_url"] = _safe_https_url(preferred["url"], congress_public_url(congress, bill_type, number))
+                break
+        enriched["history"] = payloads["actions"].get("actions") or []
+        enriched["raw_payload"] = _redact_api_keys(payloads)
+        return enriched

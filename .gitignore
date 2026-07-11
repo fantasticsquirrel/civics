@@ -8,3 +8,4 @@ test-results/
 node_modules/
 artifacts/
 .pytest_cache/
+backups/

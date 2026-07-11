@@ -1,213 +1,31 @@
 from __future__ import annotations
 
-import hashlib
 import json
-import os
-import secrets
 import sqlite3
-from contextlib import contextmanager
+import hashlib
+import base64
+import re
+from contextlib import asynccontextmanager
 
+from civics_app.auth import current_user, require_admin, require_system_admin, validate_bootstrap_token
+from civics_app.audit_providers import PROMPT_VERSION, configured_audit_provider
 from civics_app.congress import CongressGovClient, normalize_congress_bill
-from datetime import datetime, timezone
-from pathlib import Path
+from civics_app.db import connect, decode_json_field, init_db, rows_to_dicts, utcnow
+from civics_app.legiscan import LegiScanClient, normalize_legiscan_bill
+from civics_app.services.accounts import create_account
+from civics_app.services.audits import latest_bill_versions, taxonomy_version
+from civics_app.services.bills import audit_bill_for_version, immutable_version_payload, provider_actions, validated_sort
+from civics_app.services.notifications import delivery_channels
+from civics_app.services.providers import safe_provider_error
+from civics_app.ui import HTML as APP_HTML
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 APP_TITLE = "Civics Radar"
-DEFAULT_DB = "/opt/civics/data/civics.db"
-PROMPT_VERSION = "mvp-2026-06-19"
-TAXONOMY_VERSION = "mvp-default"
-
-
-def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def db_path() -> str:
-    return os.environ.get("CIVICS_DB", DEFAULT_DB)
-
-
-@contextmanager
-def connect() -> Any:
-    path = Path(db_path())
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def init_db() -> None:
-    with connect() as db:
-        db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS categories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                slug TEXT UNIQUE NOT NULL,
-                name TEXT NOT NULL,
-                description TEXT NOT NULL,
-                examples_positive TEXT NOT NULL DEFAULT '',
-                active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account_id INTEGER NOT NULL REFERENCES accounts(id),
-                email TEXT UNIQUE NOT NULL,
-                role TEXT NOT NULL DEFAULT 'user',
-                api_token TEXT UNIQUE,
-                notification_email TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS user_interests (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id),
-                category_id INTEGER NOT NULL REFERENCES categories(id),
-                min_severity TEXT NOT NULL DEFAULT 'low',
-                jurisdictions TEXT NOT NULL DEFAULT 'all',
-                active INTEGER NOT NULL DEFAULT 1,
-                UNIQUE(user_id, category_id)
-            );
-            CREATE TABLE IF NOT EXISTS bills (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                canonical_key TEXT UNIQUE NOT NULL,
-                jurisdiction_kind TEXT NOT NULL,
-                jurisdiction_code TEXT NOT NULL,
-                session TEXT NOT NULL,
-                chamber TEXT NOT NULL,
-                bill_number TEXT NOT NULL,
-                title TEXT NOT NULL,
-                summary TEXT NOT NULL,
-                status TEXT NOT NULL,
-                source_name TEXT NOT NULL,
-                source_url TEXT NOT NULL,
-                text_url TEXT NOT NULL,
-                introduced_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                text_hash TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS audit_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bill_id INTEGER NOT NULL REFERENCES bills(id),
-                taxonomy_version TEXT NOT NULL,
-                prompt_version TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                completed_at TEXT,
-                UNIQUE(bill_id, taxonomy_version, prompt_version)
-            );
-            CREATE TABLE IF NOT EXISTS audit_flags (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                audit_run_id INTEGER NOT NULL REFERENCES audit_runs(id),
-                bill_id INTEGER NOT NULL REFERENCES bills(id),
-                category_id INTEGER NOT NULL REFERENCES categories(id),
-                flag_state TEXT NOT NULL,
-                severity TEXT NOT NULL,
-                confidence REAL NOT NULL,
-                rationale TEXT NOT NULL,
-                citation TEXT NOT NULL,
-                user_summary TEXT NOT NULL,
-                UNIQUE(audit_run_id, category_id)
-            );
-            CREATE TABLE IF NOT EXISTS bill_user_matches (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id),
-                bill_id INTEGER NOT NULL REFERENCES bills(id),
-                audit_run_id INTEGER NOT NULL REFERENCES audit_runs(id),
-                category_id INTEGER NOT NULL REFERENCES categories(id),
-                status TEXT NOT NULL DEFAULT 'new',
-                created_at TEXT NOT NULL,
-                UNIQUE(user_id, bill_id, category_id)
-            );
-            CREATE TABLE IF NOT EXISTS notifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id),
-                match_id INTEGER NOT NULL REFERENCES bill_user_matches(id),
-                channel TEXT NOT NULL DEFAULT 'in_app',
-                title TEXT NOT NULL,
-                body TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'queued',
-                created_at TEXT NOT NULL,
-                delivered_at TEXT,
-                UNIQUE(user_id, match_id, channel)
-            );
-            CREATE TABLE IF NOT EXISTS ingestion_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_name TEXT NOT NULL,
-                status TEXT NOT NULL,
-                requested_limit INTEGER NOT NULL DEFAULT 0,
-                bills_seen INTEGER NOT NULL DEFAULT 0,
-                bills_upserted INTEGER NOT NULL DEFAULT 0,
-                message TEXT NOT NULL DEFAULT '',
-                started_at TEXT NOT NULL,
-                completed_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS bill_versions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bill_id INTEGER NOT NULL REFERENCES bills(id),
-                text_hash TEXT NOT NULL,
-                source_url TEXT NOT NULL,
-                text_url TEXT NOT NULL,
-                raw_payload TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL,
-                UNIQUE(bill_id, text_hash)
-            );
-            CREATE TABLE IF NOT EXISTS audit_jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                bill_id INTEGER NOT NULL REFERENCES bills(id),
-                bill_version_id INTEGER NOT NULL REFERENCES bill_versions(id),
-                taxonomy_version TEXT NOT NULL,
-                prompt_version TEXT NOT NULL,
-                provider TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'queued',
-                attempts INTEGER NOT NULL DEFAULT 0,
-                message TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                started_at TEXT,
-                completed_at TEXT,
-                UNIQUE(bill_version_id, taxonomy_version, prompt_version, provider)
-            );
-            CREATE TABLE IF NOT EXISTS notification_preferences (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL UNIQUE REFERENCES users(id),
-                digest_frequency TEXT NOT NULL DEFAULT 'instant',
-                channels TEXT NOT NULL DEFAULT '["in_app"]',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS saved_views (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id),
-                name TEXT NOT NULL,
-                filters TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                UNIQUE(user_id, name)
-            );
-            """
-        )
-        for stmt in (
-            "ALTER TABLE users ADD COLUMN api_token TEXT",
-            "ALTER TABLE users ADD COLUMN notification_email TEXT NOT NULL DEFAULT ''",
-            "ALTER TABLE ingestion_runs ADD COLUMN provider_health TEXT NOT NULL DEFAULT '{}'",
-        ):
-            try:
-                db.execute(stmt)
-            except sqlite3.OperationalError as exc:
-                if "duplicate column" not in str(exc).lower():
-                    raise
 
 
 DEFAULT_CATEGORIES = [
@@ -301,82 +119,85 @@ SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3}
 
 
 class AccountCreateIn(BaseModel):
-    account_name: str
-    email: str
-    role: str = "user"
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    account_name: str = Field(min_length=2, max_length=120)
+    email: EmailStr
+    role: str = Field(default="user", pattern=r"^(user|admin)$")
 
 
 class CategoryIn(BaseModel):
-    slug: str = Field(pattern=r"^[a-z0-9-]+$")
-    name: str
-    description: str
-    examples_positive: str = ""
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    slug: str = Field(min_length=2, max_length=64, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+    name: str = Field(min_length=2, max_length=100)
+    description: str = Field(min_length=5, max_length=1000)
+    examples_positive: str = Field(default="", max_length=2000)
+
+
+class CategoryUpdateIn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    active: bool | None = None
+    name: str | None = Field(default=None, min_length=2, max_length=100)
+    description: str | None = Field(default=None, min_length=5, max_length=1000)
+    examples_positive: str | None = Field(default=None, max_length=2000)
 
 
 class InterestIn(BaseModel):
-    email: str | None = None
-    category_slugs: list[str]
-    min_severity: str = "low"
+    model_config = ConfigDict(extra="forbid")
+    category_slugs: list[str] = Field(max_length=50)
+    min_severity: str = Field(default="low", pattern=r"^(low|medium|high)$")
     jurisdictions: list[str] = Field(default_factory=lambda: ["all"])
+
+    @field_validator("jurisdictions")
+    @classmethod
+    def valid_jurisdictions(cls, values: list[str]) -> list[str]:
+        cleaned = [v.upper() if v.lower() != "all" else "all" for v in values]
+        if not cleaned or any(v != "all" and (len(v) != 2 or not v.isalpha()) for v in cleaned):
+            raise ValueError("jurisdictions must contain 'all' or two-letter codes")
+        return list(dict.fromkeys(cleaned))
 
 
 class SavedViewIn(BaseModel):
-    name: str
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    name: str = Field(min_length=1, max_length=100)
     filters: dict[str, Any]
+
+    @field_validator("filters")
+    @classmethod
+    def valid_filters(cls, filters: dict[str, Any]) -> dict[str, Any]:
+        allowed = {"search", "jurisdiction", "status", "category", "severity", "sort", "order"}
+        if set(filters) - allowed:
+            raise ValueError("saved-view filters contain unsupported fields")
+        if any(not isinstance(value, str) or len(value) > 200 for value in filters.values()):
+            raise ValueError("saved-view filter values must be short strings")
+        if len(json.dumps(filters)) > 2_000:
+            raise ValueError("saved-view filters are too large")
+        return filters
 
 
 class NotificationPreferenceIn(BaseModel):
-    email: str | None = None
-    digest_frequency: str = "instant"
+    model_config = ConfigDict(extra="forbid")
+    digest_frequency: str = Field(default="instant", pattern=r"^(instant|daily|weekly|off)$")
     channels: list[str] = Field(default_factory=lambda: ["in_app"])
+    notification_email: EmailStr | None = None
+    telegram_chat_id: str | None = Field(default=None, max_length=100, pattern=r"^-?[0-9]{1,20}$")
+
+    @field_validator("channels")
+    @classmethod
+    def valid_channels(cls, values: list[str]) -> list[str]:
+        cleaned = list(dict.fromkeys(values))
+        if not cleaned or any(value not in {"in_app", "email", "telegram"} for value in cleaned):
+            raise ValueError("channels must contain in_app, email, and/or telegram")
+        return cleaned
+
+
+class AuditFeedbackIn(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    feedback_type: str = Field(pattern=r"^(wrong_tag|severity_too_high|severity_too_low|not_relevant)$")
+    note: str = Field(default="", max_length=1000)
 
 
 class CongressSampleSyncIn(BaseModel):
-    bills: list[dict[str, Any]]
-
-
-class AuditProvider:
-    name = "base"
-
-    def audit(self, bill: sqlite3.Row, categories: list[sqlite3.Row]) -> list[dict[str, Any]]:
-        raise NotImplementedError
-
-
-class KeywordAuditor(AuditProvider):
-    """Deterministic MVP auditor. Replace with OpenAI/Codex provider behind this interface."""
-
-    name = "keyword-mvp"
-
-    def audit(self, bill: sqlite3.Row, categories: list[sqlite3.Row]) -> list[dict[str, Any]]:
-        haystack = f"{bill['title']} {bill['summary']}".lower()
-        out: list[dict[str, Any]] = []
-        for c in categories:
-            words = [w.strip().lower() for w in c["examples_positive"].split(",") if w.strip()]
-            hits = [w for w in words if w in haystack]
-            if hits:
-                severity = "high" if len(hits) >= 3 else "medium" if len(hits) == 2 else "low"
-                confidence = min(0.95, 0.58 + 0.12 * len(hits))
-                state = "yes"
-                rationale = f"Matched category terms: {', '.join(hits)}."
-                summary = f"This bill appears relevant to {c['name']} because it mentions {', '.join(hits)}."
-            else:
-                severity = "low"
-                confidence = 0.15
-                state = "no"
-                rationale = "No category terms were found in the MVP text sample."
-                summary = f"No clear {c['name']} concern detected in the current MVP text sample."
-            out.append(
-                {
-                    "category_id": c["id"],
-                    "flag_state": state,
-                    "severity": severity,
-                    "confidence": confidence,
-                    "rationale": rationale,
-                    "citation": bill["summary"][:240],
-                    "user_summary": summary,
-                }
-            )
-        return out
+    bills: list[dict[str, Any]] = Field(max_length=250)
 
 
 def seed_defaults() -> dict[str, int]:
@@ -388,18 +209,7 @@ def seed_defaults() -> dict[str, int]:
                 "INSERT OR IGNORE INTO categories(slug,name,description,examples_positive,active,created_at) VALUES (?,?,?,?,1,?)",
                 (c["slug"], c["name"], c["description"], c["examples_positive"], now),
             )
-        db.execute("INSERT OR IGNORE INTO accounts(id,name,created_at) VALUES (1,'Demo Account',?)", (now,))
-        db.execute(
-            "INSERT OR IGNORE INTO users(id,account_id,email,role,api_token,notification_email,created_at) VALUES (1,1,'demo@example.com','user','demo-token','demo@example.com',?)",
-            (now,),
-        )
-        categories = db.execute("SELECT id FROM categories WHERE slug IN ('education','healthcare','housing')").fetchall()
-        for c in categories:
-            db.execute(
-                "INSERT OR IGNORE INTO user_interests(user_id,category_id,min_severity,jurisdictions,active) VALUES (1,?,'low','all',1)",
-                (c["id"],),
-            )
-        return {"categories": len(DEFAULT_CATEGORIES), "demo_user": 1}
+        return {"categories": len(DEFAULT_CATEGORIES)}
 
 
 def upsert_bills(bills: list[dict[str, Any]]) -> int:
@@ -423,8 +233,8 @@ def upsert_bills(bills: list[dict[str, Any]]) -> int:
             bill_row = db.execute("SELECT id FROM bills WHERE canonical_key=?", (b["canonical_key"],)).fetchone()
             if bill_row:
                 raw_payload = b.get("raw_payload", b)
-                raw_json = json.dumps(raw_payload, sort_keys=True, default=str)
-                vcur = db.execute(
+                raw_json = immutable_version_payload(b)
+                db.execute(
                     """
                     INSERT OR IGNORE INTO bill_versions(bill_id,text_hash,source_url,text_url,raw_payload,created_at)
                     VALUES (?,?,?,?,?,?)
@@ -436,12 +246,21 @@ def upsert_bills(bills: list[dict[str, Any]]) -> int:
                     (bill_row["id"], b["text_hash"]),
                 ).fetchone()
                 if version:
+                    provider = configured_audit_provider()
                     db.execute(
                         """
-                        INSERT OR IGNORE INTO audit_jobs(bill_id,bill_version_id,taxonomy_version,prompt_version,provider,status,created_at)
+                        INSERT INTO audit_jobs(bill_id,bill_version_id,taxonomy_version,prompt_version,provider,status,created_at)
                         VALUES (?,?,?,?,?,'queued',?)
+                        ON CONFLICT(bill_version_id,taxonomy_version,prompt_version,provider) DO UPDATE SET
+                          status='queued',completed_at=NULL,message='',created_at=excluded.created_at
+                        WHERE audit_jobs.status='superseded'
                         """,
-                        (bill_row["id"], version["id"], TAXONOMY_VERSION, PROMPT_VERSION, "openai-codex", utcnow()),
+                        (bill_row["id"], version["id"], taxonomy_version(db), PROMPT_VERSION, provider.name, utcnow()),
+                    )
+                for action in provider_actions(raw_payload):
+                    db.execute(
+                        "INSERT OR IGNORE INTO bill_actions(bill_id,action_date,description,source_name,source_url) VALUES (?,?,?,?,?)",
+                        (bill_row["id"], action["action_date"], action["description"], b["source_name"], b["source_url"]),
                     )
         return upserted
 
@@ -450,15 +269,16 @@ def sync_demo_bills() -> int:
     return upsert_bills(DEMO_BILLS)
 
 
-def record_ingestion_run(source_name: str, status: str, requested_limit: int, bills_seen: int = 0, bills_upserted: int = 0, message: str = "") -> dict[str, Any]:
+def record_ingestion_run(source_name: str, status: str, requested_limit: int, bills_seen: int = 0,
+                         bills_upserted: int = 0, message: str = "", jurisdiction_code: str = "") -> dict[str, Any]:
     init_db()
     with connect() as db:
         cur = db.execute(
             """
-            INSERT INTO ingestion_runs(source_name,status,requested_limit,bills_seen,bills_upserted,message,started_at,completed_at)
-            VALUES (?,?,?,?,?,?,?,?)
+            INSERT INTO ingestion_runs(source_name,jurisdiction_code,status,requested_limit,bills_seen,bills_upserted,message,started_at,completed_at)
+            VALUES (?,?,?,?,?,?,?,?,?)
             """,
-            (source_name, status, requested_limit, bills_seen, bills_upserted, message, utcnow(), utcnow()),
+            (source_name, jurisdiction_code.upper(), status, requested_limit, bills_seen, bills_upserted, message[:500], utcnow(), utcnow()),
         )
         row = db.execute("SELECT * FROM ingestion_runs WHERE id=?", (cur.lastrowid,)).fetchone()
         return dict(row)
@@ -472,7 +292,7 @@ def sync_congress_bills(limit: int = 20) -> dict[str, Any]:
         run = record_ingestion_run("Congress.gov", status["status"], limit, message=status["message"])
         return {**status, "ingestion_run": run}
     try:
-        raw_bills = client.fetch_recent_bills(limit=limit)
+        raw_bills = client.fetch_recent_bills(limit=limit, enrich=True)
         normalized = [normalize_congress_bill(item) for item in raw_bills]
         upserted = upsert_bills(normalized)
         run = record_ingestion_run("Congress.gov", "completed", limit, len(raw_bills), upserted, "")
@@ -486,65 +306,63 @@ def sync_congress_bills(limit: int = 20) -> dict[str, Any]:
             **audit_result,
         }
     except Exception as exc:
-        run = record_ingestion_run("Congress.gov", "failed", limit, message=str(exc))
-        return {"ok": False, "status": "failed", "message": str(exc), "ingestion_run": run}
+        safe_message = safe_provider_error(exc, "federal sync")
+        run = record_ingestion_run("Congress.gov", "failed", limit, message=safe_message)
+        return {"ok": False, "status": "failed", "message": safe_message, "ingestion_run": run}
 
 
-def run_audits(seed_demo: bool = True) -> dict[str, int]:
+def queue_pending_audits() -> int:
+    init_db()
+    provider = configured_audit_provider()
+    with connect() as db:
+        version = taxonomy_version(db)
+        db.execute(
+            """UPDATE audit_jobs SET status='superseded',completed_at=?,message='taxonomy superseded'
+               WHERE status IN ('queued','retry') AND taxonomy_version != ?""",
+            (utcnow(), version),
+        )
+        rows = latest_bill_versions(db)
+        created = 0
+        for row in rows:
+            cur = db.execute(
+                """INSERT INTO audit_jobs(
+                    bill_id,bill_version_id,taxonomy_version,prompt_version,provider,status,created_at
+                ) VALUES (?,?,?,?,?,'queued',?)
+                ON CONFLICT(bill_version_id,taxonomy_version,prompt_version,provider) DO UPDATE SET
+                  status='queued',completed_at=NULL,message='',created_at=excluded.created_at
+                WHERE audit_jobs.status='superseded'""",
+                (row["bill_id"], row["bill_version_id"], version, PROMPT_VERSION, provider.name, utcnow()),
+            )
+            created += max(cur.rowcount, 0)
+        return created
+
+
+def run_audits(seed_demo: bool = False) -> dict[str, int]:
     if seed_demo:
         sync_demo_bills()
-    provider = KeywordAuditor()
-    with connect() as db:
-        bills = db.execute("SELECT * FROM bills ORDER BY id").fetchall()
-        categories = db.execute("SELECT * FROM categories WHERE active=1 ORDER BY id").fetchall()
-        created = 0
-        flags = 0
-        for bill in bills:
-            existing = db.execute(
-                "SELECT id FROM audit_runs WHERE bill_id=? AND taxonomy_version=? AND prompt_version=?",
-                (bill["id"], TAXONOMY_VERSION, PROMPT_VERSION),
-            ).fetchone()
-            if existing:
-                continue
-            cur = db.execute(
-                "INSERT INTO audit_runs(bill_id,taxonomy_version,prompt_version,provider,status,created_at,completed_at) VALUES (?,?,?,?,?,?,?)",
-                (bill["id"], TAXONOMY_VERSION, PROMPT_VERSION, provider.name, "completed", utcnow(), utcnow()),
-            )
-            audit_run_id = cur.lastrowid
-            created += 1
-            for result in provider.audit(bill, categories):
-                db.execute(
-                    """
-                    INSERT INTO audit_flags(audit_run_id,bill_id,category_id,flag_state,severity,confidence,rationale,citation,user_summary)
-                    VALUES (?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        audit_run_id,
-                        bill["id"],
-                        result["category_id"],
-                        result["flag_state"],
-                        result["severity"],
-                        result["confidence"],
-                        result["rationale"],
-                        result["citation"],
-                        result["user_summary"],
-                    ),
-                )
-                flags += 1
-        return {"audit_runs_created": created, "flags_created": flags}
+    queued = queue_pending_audits()
+    processed = process_audit_jobs(limit=100, generate_after=False)
+    return {"audit_runs_created": processed["jobs_completed"], "flags_created": processed["flags_created"],
+            "jobs_queued": queued}
 
 
-def generate_matches(seed_demo: bool = True) -> dict[str, int]:
-    run_audits(seed_demo=seed_demo)
+def generate_matches(seed_demo: bool = False, ensure_audits: bool = False) -> dict[str, int]:
+    if ensure_audits:
+        run_audits(seed_demo=seed_demo)
     created_matches = 0
     created_notifications = 0
     with connect() as db:
         rows = db.execute(
             """
-            SELECT ui.user_id, ui.min_severity, af.bill_id, af.audit_run_id, af.category_id, af.severity,
-                   af.user_summary, b.bill_number, b.title, c.name AS category_name
+            SELECT ui.user_id, ui.min_severity, ui.jurisdictions, af.bill_id, af.audit_run_id, af.category_id, af.severity,
+                   af.user_summary, b.bill_number, b.title, b.jurisdiction_code, c.name AS category_name
             FROM user_interests ui
             JOIN audit_flags af ON af.category_id = ui.category_id
+            JOIN audit_runs ar ON ar.id=af.audit_run_id
+            JOIN (
+                SELECT bill_id,MAX(id) AS latest_id FROM audit_runs
+                WHERE status='completed' GROUP BY bill_id
+            ) latest ON latest.latest_id=ar.id
             JOIN bills b ON b.id = af.bill_id
             JOIN categories c ON c.id = af.category_id
             WHERE ui.active=1 AND af.flag_state IN ('yes','possible')
@@ -553,8 +371,15 @@ def generate_matches(seed_demo: bool = True) -> dict[str, int]:
         for r in rows:
             if SEVERITY_RANK[r["severity"]] < SEVERITY_RANK[r["min_severity"]]:
                 continue
+            jurisdictions = {item.strip().upper() for item in r["jurisdictions"].split(",")}
+            if "ALL" not in jurisdictions and r["jurisdiction_code"].upper() not in jurisdictions:
+                continue
             cur = db.execute(
-                "INSERT OR IGNORE INTO bill_user_matches(user_id,bill_id,audit_run_id,category_id,status,created_at) VALUES (?,?,?,?, 'new', ?)",
+                """INSERT INTO bill_user_matches(user_id,bill_id,audit_run_id,category_id,status,created_at)
+                   VALUES (?,?,?,?, 'new', ?)
+                   ON CONFLICT(user_id,bill_id,category_id) DO UPDATE SET
+                     audit_run_id=excluded.audit_run_id,status='new',created_at=excluded.created_at
+                   WHERE bill_user_matches.audit_run_id != excluded.audit_run_id""",
                 (r["user_id"], r["bill_id"], r["audit_run_id"], r["category_id"], utcnow()),
             )
             if cur.rowcount:
@@ -563,47 +388,28 @@ def generate_matches(seed_demo: bool = True) -> dict[str, int]:
                 "SELECT id FROM bill_user_matches WHERE user_id=? AND bill_id=? AND category_id=?",
                 (r["user_id"], r["bill_id"], r["category_id"]),
             ).fetchone()
-            if match:
-                ncur = db.execute(
-                    "INSERT OR IGNORE INTO notifications(user_id,match_id,channel,title,body,status,created_at,delivered_at) VALUES (?,?, 'in_app', ?, ?, 'delivered', ?, ?)",
-                    (
-                        r["user_id"],
-                        match["id"],
-                        f"{r['category_name']} flag: {r['bill_number']}",
-                        f"{r['title']} — {r['user_summary']}",
-                        utcnow(),
-                        utcnow(),
-                    ),
-                )
-                if ncur.rowcount:
-                    created_notifications += 1
+            if match and cur.rowcount:
+                preference = db.execute(
+                    "SELECT digest_frequency,channels FROM notification_preferences WHERE user_id=?", (r["user_id"],)
+                ).fetchone()
+                for channel in delivery_channels(preference):
+                    frequency = preference["digest_frequency"] if preference else "instant"
+                    status = ("delivered" if channel == "in_app" else
+                              "queued" if frequency == "instant" else "digest_pending")
+                    delivered_at = utcnow() if channel == "in_app" else None
+                    ncur = db.execute(
+                        """INSERT INTO notifications(
+                            user_id,match_id,channel,title,body,status,created_at,delivered_at
+                        ) VALUES (?,?,?,?,?,?,?,?)
+                        ON CONFLICT(user_id,match_id,channel) DO UPDATE SET
+                          title=excluded.title,body=excluded.body,status=excluded.status,
+                          created_at=excluded.created_at,delivered_at=excluded.delivered_at,last_error=''""",
+                        (r["user_id"], match["id"], channel, f"{r['category_name']} flag: {r['bill_number']}",
+                         f"{r['title']} — {r['user_summary']}", status, utcnow(), delivered_at),
+                    )
+                    if ncur.rowcount:
+                        created_notifications += 1
         return {"matches_created": created_matches, "notifications_created": created_notifications}
-
-
-def rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
-    return [dict(r) for r in rows]
-
-
-def decode_json_field(value: str, fallback: Any) -> Any:
-    try:
-        return json.loads(value) if value else fallback
-    except json.JSONDecodeError:
-        return fallback
-
-
-def resolve_user(api_token: str | None = None, email: str | None = None) -> sqlite3.Row:
-    seed_defaults()
-    with connect() as db:
-        user = None
-        if api_token:
-            user = db.execute("SELECT * FROM users WHERE api_token=?", (api_token,)).fetchone()
-        if not user and email:
-            user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-        if not user and not api_token and not email:
-            user = db.execute("SELECT * FROM users WHERE email='demo@example.com'").fetchone()
-        if not user:
-            raise HTTPException(status_code=401, detail="valid user token or email required")
-        return user
 
 
 def provider_health_snapshot() -> dict[str, Any]:
@@ -612,10 +418,16 @@ def provider_health_snapshot() -> dict[str, Any]:
     init_db()
     with connect() as db:
         latest = db.execute("SELECT * FROM ingestion_runs ORDER BY id DESC LIMIT 10").fetchall()
+        state_rows = db.execute(
+            """SELECT ir.* FROM ingestion_runs ir JOIN (
+                SELECT jurisdiction_code,MAX(id) AS latest_id FROM ingestion_runs
+                WHERE source_name LIKE 'LegiScan:%' GROUP BY jurisdiction_code
+            ) latest ON latest.latest_id=ir.id ORDER BY ir.jurisdiction_code"""
+        ).fetchall()
     return {
         "providers": {
             "congress_gov": congress_status,
-            "legiscan": legiscan_status,
+            "legiscan": {**legiscan_status, "states": rows_to_dicts(state_rows)},
         },
         "recent_ingestion_runs": rows_to_dicts(latest),
         "representative_lookup": representative_links("US"),
@@ -623,99 +435,195 @@ def provider_health_snapshot() -> dict[str, Any]:
 
 
 def legiscan_status_snapshot() -> dict[str, Any]:
-    if not os.environ.get("LEGISCAN_API_KEY"):
-        return {"ok": False, "status": "missing_api_key", "message": "Set LEGISCAN_API_KEY to enable state bill ingestion."}
-    return {"ok": True, "status": "ready"}
+    return LegiScanClient().status()
 
 
 def sync_legiscan_bills(state: str, limit: int = 20) -> dict[str, Any]:
     seed_defaults()
-    status = legiscan_status_snapshot()
+    state = state.upper()
+    client = LegiScanClient()
+    status = client.status()
     if not status["ok"]:
-        run = record_ingestion_run("LegiScan", status["status"], limit, message=status["message"])
+        run = record_ingestion_run(f"LegiScan:{state}", status["status"], limit, message=status["message"], jurisdiction_code=state)
         return {**status, "ingestion_run": run}
-    # Provider wiring is intentionally conservative until a live key is configured; the API/status path is in place.
-    run = record_ingestion_run("LegiScan", "ready_not_synced", limit, 0, 0, f"LegiScan key configured; live {state.upper()} adapter pending provider smoke test.")
-    return {"ok": True, "status": "ready_not_synced", "ingestion_run": run}
+    try:
+        raw = client.fetch_bills(state, limit)
+        normalized = [normalize_legiscan_bill(item) for item in raw]
+        upserted = upsert_bills(normalized)
+        run = record_ingestion_run(f"LegiScan:{state}", "completed", limit, len(raw), upserted, jurisdiction_code=state)
+        return {"ok": True, "status": "completed", "bills_seen": len(raw), "bills_upserted": upserted,
+                "ingestion_run": run, **process_audit_jobs(limit=max(10, min(limit, 100)))}
+    except Exception as exc:
+        safe_message = safe_provider_error(exc, "state sync")
+        run = record_ingestion_run(f"LegiScan:{state}", "failed", limit, message=safe_message, jurisdiction_code=state)
+        return {"ok": False, "status": "failed", "message": safe_message, "ingestion_run": run}
 
 
-def deterministic_audit_for_bill(bill: sqlite3.Row, categories: list[sqlite3.Row], provider_name: str = "openai-codex-fallback") -> list[dict[str, Any]]:
-    # This keeps the worker deterministic when OPENAI_API_KEY/Codex CLI are not configured; the storage contract is the same.
-    return KeywordAuditor().audit(bill, categories)
-
-
-def process_audit_jobs(limit: int = 10) -> dict[str, int]:
+def process_audit_jobs(limit: int = 10, generate_after: bool = True) -> dict[str, int]:
     seed_defaults()
     jobs_started = 0
     jobs_completed = 0
+    jobs_retried = 0
+    jobs_failed = 0
     flags_created = 0
+    bounded_limit = max(1, min(int(limit), 100))
     with connect() as db:
-        jobs = db.execute(
-            """
-            SELECT aj.*, b.* FROM audit_jobs aj
-            JOIN bills b ON b.id=aj.bill_id
-            WHERE aj.status IN ('queued','retry')
-            ORDER BY aj.id LIMIT ?
-            """,
-            (max(1, min(int(limit), 100)),),
-        ).fetchall()
-        categories = db.execute("SELECT * FROM categories WHERE active=1 ORDER BY id").fetchall()
-        for job in jobs:
+        stale_before = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat(timespec="seconds")
+        db.execute(
+            """UPDATE audit_jobs SET status='retry',message='recovered stale worker claim',completed_at=?
+               WHERE status='running' AND started_at < ?""",
+            (utcnow(), stale_before),
+        )
+        current_taxonomy = taxonomy_version(db)
+        db.execute(
+            """UPDATE audit_jobs SET status='superseded',completed_at=?,message='taxonomy superseded'
+               WHERE status IN ('queued','retry') AND taxonomy_version != ?""",
+            (utcnow(), current_taxonomy),
+        )
+        job_ids = [row["id"] for row in db.execute(
+            "SELECT id FROM audit_jobs WHERE status IN ('queued','retry') ORDER BY id LIMIT ?",
+            (bounded_limit,),
+        ).fetchall()]
+
+    for job_id in job_ids:
+        with connect() as db:
+            job = db.execute(
+                "SELECT * FROM audit_jobs WHERE id=? AND status IN ('queued','retry')", (job_id,)
+            ).fetchone()
+            if not job:
+                continue
+            claimed = db.execute(
+                """UPDATE audit_jobs SET status='running',attempts=attempts+1,started_at=?,completed_at=NULL,message=''
+                   WHERE id=? AND status IN ('queued','retry')""",
+                (utcnow(), job_id),
+            )
+            if not claimed.rowcount:
+                continue
             jobs_started += 1
-            db.execute("UPDATE audit_jobs SET status='running', attempts=attempts+1, started_at=?, message='' WHERE id=?", (utcnow(), job["id"]))
+            if job["taxonomy_version"] != taxonomy_version(db):
+                db.execute("UPDATE audit_jobs SET status='superseded',completed_at=?,message='taxonomy superseded' WHERE id=?",
+                           (utcnow(), job_id))
+                continue
             bill = db.execute("SELECT * FROM bills WHERE id=?", (job["bill_id"],)).fetchone()
             if not bill:
-                db.execute("UPDATE audit_jobs SET status='failed', message='bill missing', completed_at=? WHERE id=?", (utcnow(), job["id"]))
+                db.execute("UPDATE audit_jobs SET status='failed', message='bill missing', completed_at=? WHERE id=?", (utcnow(), job_id))
+                jobs_failed += 1
                 continue
             existing = db.execute(
-                "SELECT id FROM audit_runs WHERE bill_id=? AND taxonomy_version=? AND prompt_version=?",
-                (bill["id"], job["taxonomy_version"], job["prompt_version"]),
+                "SELECT id FROM audit_runs WHERE bill_version_id=? AND taxonomy_version=? AND prompt_version=?",
+                (job["bill_version_id"], job["taxonomy_version"], job["prompt_version"]),
             ).fetchone()
             if existing:
-                db.execute("UPDATE audit_jobs SET status='completed', message='audit already existed', completed_at=? WHERE id=?", (utcnow(), job["id"]))
+                db.execute("UPDATE audit_jobs SET status='completed', message='audit already existed', completed_at=? WHERE id=?", (utcnow(), job_id))
                 jobs_completed += 1
                 continue
-            cur = db.execute(
-                "INSERT INTO audit_runs(bill_id,taxonomy_version,prompt_version,provider,status,created_at,completed_at) VALUES (?,?,?,?,?,?,?)",
-                (bill["id"], job["taxonomy_version"], job["prompt_version"], job["provider"], "completed", utcnow(), utcnow()),
-            )
-            audit_run_id = cur.lastrowid
-            for result in deterministic_audit_for_bill(bill, categories):
-                db.execute(
-                    """
-                    INSERT INTO audit_flags(audit_run_id,bill_id,category_id,flag_state,severity,confidence,rationale,citation,user_summary)
-                    VALUES (?,?,?,?,?,?,?,?,?)
-                    """,
-                    (audit_run_id, bill["id"], result["category_id"], result["flag_state"], result["severity"], result["confidence"], result["rationale"], result["citation"], result["user_summary"]),
+            version = db.execute("SELECT raw_payload FROM bill_versions WHERE id=?", (job["bill_version_id"],)).fetchone()
+            audit_bill = audit_bill_for_version(bill, version["raw_payload"] if version else None)
+            categories = [dict(row) for row in db.execute("SELECT * FROM categories WHERE active=1 ORDER BY id").fetchall()]
+            job_data = dict(job)
+
+        try:
+            provider = configured_audit_provider()
+            # Provider I/O intentionally runs without an open SQLite transaction.
+            results = provider.audit(audit_bill, categories)
+            with connect() as db:
+                existing = db.execute(
+                    "SELECT id FROM audit_runs WHERE bill_version_id=? AND taxonomy_version=? AND prompt_version=?",
+                    (job_data["bill_version_id"], job_data["taxonomy_version"], job_data["prompt_version"]),
+                ).fetchone()
+                if existing:
+                    db.execute("UPDATE audit_jobs SET status='completed',message='audit already existed',completed_at=? WHERE id=?",
+                               (utcnow(), job_id))
+                    jobs_completed += 1
+                    continue
+                cur = db.execute(
+                    """INSERT INTO audit_runs(
+                        bill_id,bill_version_id,taxonomy_version,prompt_version,provider,model,status,created_at,completed_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (audit_bill["id"], job_data["bill_version_id"], job_data["taxonomy_version"], job_data["prompt_version"],
+                     provider.name, provider.model, "completed", utcnow(), utcnow()),
                 )
-                flags_created += 1
-            db.execute("UPDATE audit_jobs SET status='completed', completed_at=?, message='completed' WHERE id=?", (utcnow(), job["id"]))
-            jobs_completed += 1
-    match_result = generate_matches(seed_demo=False)
-    return {"jobs_started": jobs_started, "jobs_completed": jobs_completed, "flags_created": flags_created, **match_result}
+                audit_run_id = cur.lastrowid
+                for result in results:
+                    db.execute(
+                        """INSERT INTO audit_flags(
+                            audit_run_id,bill_id,category_id,flag_state,severity,confidence,rationale,citation,user_summary,affected_groups,concerns
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                        (audit_run_id, audit_bill["id"], result["category_id"], result["flag_state"], result["severity"],
+                         result["confidence"], result["rationale"], result["citation"], result["user_summary"],
+                         json.dumps(result.get("affected_groups", [])), json.dumps(result.get("concerns", []))),
+                    )
+                    flags_created += 1
+                db.execute("UPDATE audit_jobs SET status='completed', completed_at=?, message='completed' WHERE id=?", (utcnow(), job_id))
+                jobs_completed += 1
+        except Exception as exc:
+            with connect() as db:
+                attempt_row = db.execute("SELECT attempts FROM audit_jobs WHERE id=?", (job_id,)).fetchone()
+                retry_status = "failed" if attempt_row and attempt_row["attempts"] >= 3 else "retry"
+                message = f"{type(exc).__name__}: audit failed"
+                db.execute("UPDATE audit_jobs SET status=?,completed_at=?,message=? WHERE id=?",
+                           (retry_status, utcnow(), message, job_id))
+            if retry_status == "failed":
+                jobs_failed += 1
+            else:
+                jobs_retried += 1
+    match_result = generate_matches(seed_demo=False, ensure_audits=False) if generate_after else {"matches_created": 0, "notifications_created": 0}
+    return {"jobs_started": jobs_started, "jobs_completed": jobs_completed, "jobs_retried": jobs_retried,
+            "jobs_failed": jobs_failed, "flags_created": flags_created, **match_result}
 
 
-def create_account(payload: AccountCreateIn) -> dict[str, Any]:
-    seed_defaults()
-    token = secrets.token_urlsafe(24)
-    with connect() as db:
-        cur = db.execute("INSERT INTO accounts(name,created_at) VALUES (?,?)", (payload.account_name, utcnow()))
-        user_cur = db.execute(
-            "INSERT INTO users(account_id,email,role,api_token,notification_email,created_at) VALUES (?,?,?,?,?,?)",
-            (cur.lastrowid, payload.email, payload.role, token, payload.email, utcnow()),
-        )
-        account = dict(db.execute("SELECT * FROM accounts WHERE id=?", (cur.lastrowid,)).fetchone())
-        user = dict(db.execute("SELECT * FROM users WHERE id=?", (user_cur.lastrowid,)).fetchone())
-    user.pop("api_token", None)
-    return {"account": account, "user": user, "api_token": token}
-
-
-app = FastAPI(title=APP_TITLE)
-
-
-@app.on_event("startup")
-def startup() -> None:
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    validate_bootstrap_token()
     init_db()
+    yield
+
+
+app = FastAPI(title=APP_TITLE, lifespan=lifespan)
+_STYLE = re.search(r"<style>(.*?)</style>", APP_HTML, re.DOTALL).group(1)
+_SCRIPT = re.search(r"<script>(.*?)</script>", APP_HTML, re.DOTALL).group(1)
+_STYLE_HASH = base64.b64encode(hashlib.sha256(_STYLE.encode()).digest()).decode()
+_SCRIPT_HASH = base64.b64encode(hashlib.sha256(_SCRIPT.encode()).digest()).decode()
+RATE_LIMITS: dict[tuple[str, str], list[float]] = {}
+RATE_LIMIT_WINDOW_SECONDS = 60.0
+RATE_LIMIT_MAX_REQUESTS = 120
+
+
+def _secure_response(request: Request, response: Response) -> Response:
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    response.headers["Content-Security-Policy"] = (
+        f"default-src 'self'; script-src 'self' 'sha256-{_SCRIPT_HASH}'; style-src 'self' 'sha256-{_STYLE_HASH}'; "
+        "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    )
+    if request.url.scheme == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+
+@app.middleware("http")
+async def security_headers_and_rate_limit(request: Request, call_next):
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > 1_048_576:
+                return _secure_response(request, JSONResponse(status_code=413, content={"detail": "request body too large"}))
+        except ValueError:
+            return _secure_response(request, JSONResponse(status_code=400, content={"detail": "invalid content-length header"}))
+    client_host = request.client.host if request.client else "unknown"
+    route_key = "admin" if request.url.path.startswith("/api/admin") else "default"
+    now_ts = datetime.now(timezone.utc).timestamp()
+    bucket = RATE_LIMITS.setdefault((client_host, route_key), [])
+    while bucket and bucket[0] <= now_ts - RATE_LIMIT_WINDOW_SECONDS:
+        bucket.pop(0)
+    if len(bucket) >= RATE_LIMIT_MAX_REQUESTS:
+        return _secure_response(request, JSONResponse(status_code=429, content={"detail": "rate limit exceeded"}))
+    bucket.append(now_ts)
+    response = await call_next(request)
+    return _secure_response(request, response)
 
 
 @app.get("/api/health")
@@ -732,39 +640,68 @@ def health() -> dict[str, Any]:
 
 
 @app.post("/api/admin/seed")
-def api_seed() -> dict[str, Any]:
+def api_seed(_: sqlite3.Row | dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     return {"ok": True, **seed_defaults()}
 
 
-@app.post("/api/admin/accounts")
-def api_create_account(payload: AccountCreateIn) -> dict[str, Any]:
-    return create_account(payload)
+@app.post("/api/admin/accounts", status_code=201)
+def api_create_account(payload: AccountCreateIn, _: sqlite3.Row | dict[str, Any] = Depends(require_system_admin)) -> dict[str, Any]:
+    try:
+        return create_account(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/api/me")
-def api_me(x_api_token: str | None = Header(default=None)) -> dict[str, Any]:
-    user = resolve_user(api_token=x_api_token)
+def api_me(user: sqlite3.Row | dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     with connect() as db:
         account = db.execute("SELECT * FROM accounts WHERE id=?", (user["account_id"],)).fetchone()
     safe_user = dict(user)
     safe_user.pop("api_token", None)
+    safe_user.pop("api_token_hash", None)
+    safe_user.pop("api_token_prefix", None)
     return {"user": safe_user, "account": dict(account) if account else None}
 
 
 @app.get("/api/admin/provider-health")
-def api_provider_health() -> dict[str, Any]:
+def api_provider_health(_: sqlite3.Row | dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     return provider_health_snapshot()
 
 
+@app.get("/api/admin/ops")
+def api_admin_ops(_: sqlite3.Row | dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    from civics_app.notification_delivery import SMTPDelivery, TelegramDelivery
+
+    with connect() as db:
+        audit_queue = {row["status"]: row["count"] for row in db.execute(
+            "SELECT status,COUNT(*) AS count FROM audit_jobs GROUP BY status"
+        ).fetchall()}
+        notification_queue = {row["status"]: row["count"] for row in db.execute(
+            "SELECT status,COUNT(*) AS count FROM notifications GROUP BY status"
+        ).fetchall()}
+        recent = rows_to_dicts(db.execute("SELECT * FROM ingestion_runs ORDER BY id DESC LIMIT 25").fetchall())
+        feedback_count = db.execute("SELECT COUNT(*) FROM audit_feedback").fetchone()[0]
+    return {
+        "providers": provider_health_snapshot()["providers"],
+        "recent_ingestion_runs": recent,
+        "audit_queue": audit_queue,
+        "notification_queue": notification_queue,
+        "delivery": {"email": "ready" if SMTPDelivery().ready else "not_configured",
+                     "telegram": "ready" if TelegramDelivery().ready else "not_configured"},
+        "feedback_count": feedback_count,
+        "service_health": {"status": "managed_externally", "detail": "Inspect systemd timers on the host."},
+    }
+
+
 @app.get("/api/categories")
-def list_categories() -> list[dict[str, Any]]:
+def list_categories(_: sqlite3.Row | dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
     seed_defaults()
     with connect() as db:
         return rows_to_dicts(db.execute("SELECT * FROM categories ORDER BY id").fetchall())
 
 
 @app.post("/api/admin/categories")
-def create_category(category: CategoryIn) -> dict[str, Any]:
+def create_category(category: CategoryIn, _: sqlite3.Row | dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     seed_defaults()
     with connect() as db:
         try:
@@ -774,31 +711,53 @@ def create_category(category: CategoryIn) -> dict[str, Any]:
             )
         except sqlite3.IntegrityError as exc:
             raise HTTPException(status_code=409, detail="category slug already exists") from exc
-        return dict(db.execute("SELECT * FROM categories WHERE id=?", (cur.lastrowid,)).fetchone())
+        result = dict(db.execute("SELECT * FROM categories WHERE id=?", (cur.lastrowid,)).fetchone())
+        result["taxonomy_version"] = taxonomy_version(db)
+    queue_pending_audits()
+    return result
+
+
+@app.patch("/api/admin/categories/{category_id}")
+def update_category(category_id: int, payload: CategoryUpdateIn,
+                    _: sqlite3.Row | dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
+    updates = payload.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(status_code=422, detail="at least one field is required")
+    with connect() as db:
+        row = db.execute("SELECT * FROM categories WHERE id=?", (category_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="category not found")
+        assignments = ",".join(f"{key}=?" for key in updates)
+        values = [int(value) if key == "active" else value for key, value in updates.items()]
+        db.execute(f"UPDATE categories SET {assignments},updated_at=? WHERE id=?", [*values, utcnow(), category_id])
+        result = dict(db.execute("SELECT * FROM categories WHERE id=?", (category_id,)).fetchone())
+        result["taxonomy_version"] = taxonomy_version(db)
+    queue_pending_audits()
+    return result
 
 
 @app.post("/api/admin/sync-demo-bills")
-def api_sync_demo_bills() -> dict[str, Any]:
+def api_sync_demo_bills(_: sqlite3.Row | dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     return {"ok": True, "bills_upserted": sync_demo_bills()}
 
 
 @app.post("/api/admin/sync-congress")
-def api_sync_congress(limit: int = Query(default=20, ge=1, le=250)) -> dict[str, Any]:
+def api_sync_congress(limit: int = Query(default=20, ge=1, le=250), _: sqlite3.Row | dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     return sync_congress_bills(limit=limit)
 
 
 @app.post("/api/admin/sync-legiscan")
-def api_sync_legiscan(state: str = Query(default="MO", min_length=2, max_length=2), limit: int = Query(default=20, ge=1, le=250)) -> dict[str, Any]:
+def api_sync_legiscan(state: str = Query(default="MO", pattern=r"^[A-Za-z]{2}$"), limit: int = Query(default=20, ge=1, le=250), _: sqlite3.Row | dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     return sync_legiscan_bills(state=state, limit=limit)
 
 
 @app.post("/api/admin/process-audit-jobs")
-def api_process_audit_jobs(limit: int = Query(default=10, ge=1, le=100)) -> dict[str, Any]:
+def api_process_audit_jobs(limit: int = Query(default=10, ge=1, le=100), _: sqlite3.Row | dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     return {"ok": True, **process_audit_jobs(limit=limit)}
 
 
 @app.post("/api/admin/sync-congress-sample")
-def api_sync_congress_sample(payload: CongressSampleSyncIn) -> dict[str, Any]:
+def api_sync_congress_sample(payload: CongressSampleSyncIn, _: sqlite3.Row | dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     normalized = [normalize_congress_bill(item) for item in payload.bills]
     upserted = upsert_bills(normalized)
     run = record_ingestion_run("Congress.gov", "sample_completed", len(payload.bills), len(payload.bills), upserted, "sample fixture sync")
@@ -807,32 +766,35 @@ def api_sync_congress_sample(payload: CongressSampleSyncIn) -> dict[str, Any]:
 
 
 @app.get("/api/admin/ingestion-runs")
-def api_ingestion_runs() -> list[dict[str, Any]]:
+def api_ingestion_runs(_: sqlite3.Row | dict[str, Any] = Depends(require_admin)) -> list[dict[str, Any]]:
     init_db()
     with connect() as db:
         return rows_to_dicts(db.execute("SELECT * FROM ingestion_runs ORDER BY id DESC LIMIT 25").fetchall())
 
 
 @app.post("/api/admin/run-audits")
-def api_run_audits() -> dict[str, Any]:
+def api_run_audits(_: sqlite3.Row | dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     return {"ok": True, **run_audits()}
 
 
 @app.post("/api/admin/generate-matches")
-def api_generate_matches() -> dict[str, Any]:
+def api_generate_matches(_: sqlite3.Row | dict[str, Any] = Depends(require_admin)) -> dict[str, Any]:
     return {"ok": True, **generate_matches()}
 
 
 @app.post("/api/interests")
-def set_interests(payload: InterestIn, x_api_token: str | None = Header(default=None)) -> dict[str, Any]:
+def set_interests(payload: InterestIn, user: sqlite3.Row | dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     seed_defaults()
-    user = resolve_user(api_token=x_api_token, email=payload.email)
     with connect() as db:
         db.execute("UPDATE user_interests SET active=0 WHERE user_id=?", (user["id"],))
         categories = db.execute(
-            f"SELECT id, slug FROM categories WHERE slug IN ({','.join(['?']*len(payload.category_slugs))})",
+            f"SELECT id, slug FROM categories WHERE active=1 AND slug IN ({','.join(['?']*len(payload.category_slugs))})",
             payload.category_slugs,
         ).fetchall() if payload.category_slugs else []
+        found = {category["slug"] for category in categories}
+        missing = set(payload.category_slugs) - found
+        if missing:
+            raise HTTPException(status_code=422, detail=f"unknown categories: {', '.join(sorted(missing))}")
         jurisdictions = ",".join(j.upper() for j in payload.jurisdictions) if payload.jurisdictions else "all"
         for c in categories:
             db.execute(
@@ -847,13 +809,18 @@ def set_interests(payload: InterestIn, x_api_token: str | None = Header(default=
 
 @app.get("/api/bills")
 def list_bills(
-    category: str | None = Query(default=None),
-    search: str | None = Query(default=None),
-    jurisdiction: str | None = Query(default=None),
-    status: str | None = Query(default=None),
-    severity: str | None = Query(default=None),
-) -> list[dict[str, Any]]:
-    generate_matches()
+    category: str | None = Query(default=None, max_length=64, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$"),
+    search: str | None = Query(default=None, max_length=200),
+    jurisdiction: str | None = Query(default=None, pattern=r"^[A-Za-z]{2}$"),
+    status: str | None = Query(default=None, max_length=100),
+    severity: str | None = Query(default=None, pattern=r"^(low|medium|high)$"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    sort: str = Query(default="updated_at", pattern=r"^(updated_at|introduced_at|title|bill_number)$"),
+    order: str = Query(default="desc", pattern=r"^(asc|desc)$"),
+    _: sqlite3.Row | dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    sort, sql_order = validated_sort(sort, order)
     with connect() as db:
         params: list[Any] = []
         joins = ""
@@ -877,16 +844,18 @@ def list_bills(
         if status:
             where.append("lower(b.status) LIKE ?")
             params.append(f"%{status.lower()}%")
+        base = f"FROM bills b {joins} WHERE {' AND '.join(where)}"
+        total = db.execute(f"SELECT COUNT(DISTINCT b.id) {base}", params).fetchone()[0]
         rows = db.execute(
-            f"SELECT DISTINCT b.* FROM bills b {joins} WHERE {' AND '.join(where)} ORDER BY b.updated_at DESC",
-            params,
+            f"SELECT DISTINCT b.* {base} ORDER BY b.{sort} {sql_order}, b.id DESC LIMIT ? OFFSET ?",
+            [*params, page_size, (page - 1) * page_size],
         ).fetchall()
-        return rows_to_dicts(rows)
+        return {"items": rows_to_dicts(rows), "page": page, "page_size": page_size, "total": total,
+                "pages": (total + page_size - 1) // page_size}
 
 
 @app.get("/api/bills/{bill_id}")
-def bill_detail(bill_id: int) -> dict[str, Any]:
-    generate_matches()
+def bill_detail(bill_id: int, _: sqlite3.Row | dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     with connect() as db:
         bill = db.execute("SELECT * FROM bills WHERE id=?", (bill_id,)).fetchone()
         if not bill:
@@ -895,20 +864,47 @@ def bill_detail(bill_id: int) -> dict[str, Any]:
             """
             SELECT af.*, c.slug, c.name, c.description FROM audit_flags af
             JOIN categories c ON c.id=af.category_id
-            WHERE af.bill_id=? ORDER BY CASE af.flag_state WHEN 'yes' THEN 1 WHEN 'possible' THEN 2 ELSE 3 END, c.name
+            WHERE af.audit_run_id=(
+                SELECT id FROM audit_runs WHERE bill_id=? AND status='completed' ORDER BY id DESC LIMIT 1
+            )
+            ORDER BY CASE af.flag_state WHEN 'yes' THEN 1 WHEN 'possible' THEN 2 ELSE 3 END, c.name
             """,
             (bill_id,),
         ).fetchall()
-        return {"bill": dict(bill), "flags": rows_to_dicts(flags), "representative_links": representative_links(bill["jurisdiction_code"])}
+        versions = db.execute("SELECT id,text_hash,source_url,text_url,created_at FROM bill_versions WHERE bill_id=? ORDER BY id DESC", (bill_id,)).fetchall()
+        runs = db.execute("SELECT id,bill_version_id,taxonomy_version,prompt_version,provider,model,status,created_at,completed_at FROM audit_runs WHERE bill_id=? ORDER BY id DESC", (bill_id,)).fetchall()
+        timeline = db.execute("SELECT action_date,description,source_name,source_url FROM bill_actions WHERE bill_id=? ORDER BY action_date DESC,id DESC", (bill_id,)).fetchall()
+        decoded_flags = rows_to_dicts(flags)
+        for flag in decoded_flags:
+            flag["affected_groups"] = decode_json_field(flag.get("affected_groups"), [])
+            flag["concerns"] = decode_json_field(flag.get("concerns"), [])
+        return {"bill": dict(bill), "official_sources": {"record": bill["source_url"], "text": bill["text_url"], "provider": bill["source_name"]},
+                "versions": rows_to_dicts(versions), "audit_runs": rows_to_dicts(runs), "timeline": rows_to_dicts(timeline), "flags": decoded_flags,
+                "audit_disclaimer": "Automated relevance screening is informational, may be incomplete, and is not legal advice.",
+                "representative_links": representative_links(bill["jurisdiction_code"])}
+
+
+@app.post("/api/audit-flags/{audit_flag_id}/feedback", status_code=201)
+def create_audit_feedback(audit_flag_id: int, payload: AuditFeedbackIn,
+                          user: sqlite3.Row | dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    with connect() as db:
+        if not db.execute("SELECT id FROM audit_flags WHERE id=?", (audit_flag_id,)).fetchone():
+            raise HTTPException(status_code=404, detail="audit flag not found")
+        db.execute(
+            """INSERT INTO audit_feedback(user_id,audit_flag_id,feedback_type,note,created_at) VALUES (?,?,?,?,?)
+               ON CONFLICT(user_id,audit_flag_id,feedback_type) DO UPDATE SET note=excluded.note,created_at=excluded.created_at""",
+            (user["id"], audit_flag_id, payload.feedback_type, payload.note, utcnow()),
+        )
+        return dict(db.execute(
+            "SELECT * FROM audit_feedback WHERE user_id=? AND audit_flag_id=? AND feedback_type=?",
+            (user["id"], audit_flag_id, payload.feedback_type),
+        ).fetchone())
 
 
 @app.get("/api/dashboard")
-def dashboard(email: str = "demo@example.com") -> dict[str, Any]:
-    generate_matches()
+def dashboard(page: int = Query(default=1, ge=1), page_size: int = Query(default=20, ge=1, le=100),
+              user: sqlite3.Row | dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     with connect() as db:
-        user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-        if not user:
-            raise HTTPException(status_code=404, detail="user not found")
         matches = db.execute(
             """
             SELECT m.id AS match_id, m.status AS match_status, b.id AS bill_id, b.bill_number, b.title, b.jurisdiction_code, b.status,
@@ -917,13 +913,13 @@ def dashboard(email: str = "demo@example.com") -> dict[str, Any]:
             JOIN bills b ON b.id=m.bill_id
             JOIN categories c ON c.id=m.category_id
             JOIN audit_flags af ON af.audit_run_id=m.audit_run_id AND af.category_id=m.category_id
-            WHERE m.user_id=? ORDER BY m.created_at DESC, b.updated_at DESC
+            WHERE m.user_id=? ORDER BY m.created_at DESC, b.updated_at DESC LIMIT ? OFFSET ?
             """,
-            (user["id"],),
+            (user["id"], page_size, (page - 1) * page_size),
         ).fetchall()
         notifications = db.execute(
-            "SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 20",
-            (user["id"],),
+            "SELECT * FROM notifications WHERE user_id=? AND channel='in_app' ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (user["id"], page_size, (page - 1) * page_size),
         ).fetchall()
         interests = db.execute(
             """
@@ -933,7 +929,8 @@ def dashboard(email: str = "demo@example.com") -> dict[str, Any]:
             (user["id"],),
         ).fetchall()
         return {
-            "user": dict(user),
+            "user": {k: v for k, v in dict(user).items() if k not in {"api_token", "api_token_hash", "api_token_prefix"}},
+            "page": page, "page_size": page_size,
             "interests": rows_to_dicts(interests),
             "matches": rows_to_dicts(matches),
             "notifications": rows_to_dicts(notifications),
@@ -941,10 +938,15 @@ def dashboard(email: str = "demo@example.com") -> dict[str, Any]:
 
 
 @app.post("/api/notification-preferences")
-def api_notification_preferences(payload: NotificationPreferenceIn, x_api_token: str | None = Header(default=None)) -> dict[str, Any]:
-    user = resolve_user(api_token=x_api_token, email=payload.email)
-    channels = [c for c in payload.channels if c in {"in_app", "email", "telegram", "sms"}] or ["in_app"]
+def api_notification_preferences(payload: NotificationPreferenceIn, user: sqlite3.Row | dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    channels = payload.channels
     with connect() as db:
+        if payload.notification_email is not None or payload.telegram_chat_id is not None:
+            db.execute(
+                "UPDATE users SET notification_email=COALESCE(?,notification_email),telegram_chat_id=COALESCE(?,telegram_chat_id) WHERE id=?",
+                (str(payload.notification_email).lower() if payload.notification_email else None,
+                 payload.telegram_chat_id, user["id"]),
+            )
         db.execute(
             """
             INSERT INTO notification_preferences(user_id,digest_frequency,channels,created_at,updated_at)
@@ -953,16 +955,50 @@ def api_notification_preferences(payload: NotificationPreferenceIn, x_api_token:
             """,
             (user["id"], payload.digest_frequency, json.dumps(channels), utcnow(), utcnow()),
         )
+        if payload.digest_frequency == "off":
+            db.execute(
+                """UPDATE notifications SET status='cancelled',last_error=''
+                   WHERE user_id=? AND channel IN ('email','telegram')
+                     AND status IN ('queued','digest_pending','not_configured')""",
+                (user["id"],),
+            )
+        elif payload.digest_frequency == "instant":
+            db.execute(
+                "UPDATE notifications SET status='queued' WHERE user_id=? AND status='digest_pending'",
+                (user["id"],),
+            )
+        else:
+            db.execute(
+                """UPDATE notifications SET status='digest_pending'
+                   WHERE user_id=? AND channel IN ('email','telegram') AND status='queued'""",
+                (user["id"],),
+            )
         row = db.execute("SELECT * FROM notification_preferences WHERE user_id=?", (user["id"],)).fetchone()
+        delivery = db.execute("SELECT notification_email,telegram_chat_id FROM users WHERE id=?", (user["id"],)).fetchone()
     out = dict(row)
     out["channels"] = decode_json_field(out["channels"], [])
+    out["notification_email"] = delivery["notification_email"]
+    out["telegram_chat_configured"] = bool(delivery["telegram_chat_id"])
     return out
 
 
+@app.get("/api/notification-preferences")
+def api_get_notification_preferences(user: sqlite3.Row | dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    with connect() as db:
+        row = db.execute("SELECT * FROM notification_preferences WHERE user_id=?", (user["id"],)).fetchone()
+        delivery = db.execute("SELECT notification_email,telegram_chat_id FROM users WHERE id=?", (user["id"],)).fetchone()
+    result = dict(row) if row else {
+        "user_id": user["id"], "digest_frequency": "instant", "channels": '["in_app"]',
+        "created_at": None, "updated_at": None,
+    }
+    result["channels"] = decode_json_field(result["channels"], ["in_app"])
+    result["notification_email"] = delivery["notification_email"] if delivery else ""
+    result["telegram_chat_configured"] = bool(delivery and delivery["telegram_chat_id"])
+    return result
+
+
 @app.get("/api/notifications/digest")
-def api_notification_digest(email: str = "demo@example.com", x_api_token: str | None = Header(default=None)) -> dict[str, Any]:
-    user = resolve_user(api_token=x_api_token, email=email)
-    generate_matches(seed_demo=False)
+def api_notification_digest(user: sqlite3.Row | dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     with connect() as db:
         rows = db.execute(
             """
@@ -981,9 +1017,28 @@ def api_notification_digest(email: str = "demo@example.com", x_api_token: str | 
     return {"user_id": user["id"], "notification_count": len(rows), "sections": sections}
 
 
+@app.patch("/api/notifications/{notification_id}/read")
+def api_mark_notification_read(notification_id: int, user: sqlite3.Row | dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    with connect() as db:
+        cur = db.execute("UPDATE notifications SET status='read' WHERE id=? AND user_id=?", (notification_id, user["id"]))
+        if not cur.rowcount:
+            raise HTTPException(status_code=404, detail="notification not found")
+        row = db.execute("SELECT * FROM notifications WHERE id=? AND user_id=?", (notification_id, user["id"])).fetchone()
+    return dict(row)
+
+
+@app.patch("/api/matches/{match_id}/read")
+def api_mark_match_read(match_id: int, user: sqlite3.Row | dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    with connect() as db:
+        cur = db.execute("UPDATE bill_user_matches SET status='read' WHERE id=? AND user_id=?", (match_id, user["id"]))
+        if not cur.rowcount:
+            raise HTTPException(status_code=404, detail="match not found")
+        row = db.execute("SELECT * FROM bill_user_matches WHERE id=? AND user_id=?", (match_id, user["id"])).fetchone()
+    return dict(row)
+
+
 @app.post("/api/saved-views")
-def api_create_saved_view(payload: SavedViewIn, x_api_token: str | None = Header(default=None)) -> dict[str, Any]:
-    user = resolve_user(api_token=x_api_token)
+def api_create_saved_view(payload: SavedViewIn, user: sqlite3.Row | dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     with connect() as db:
         db.execute(
             """
@@ -999,13 +1054,21 @@ def api_create_saved_view(payload: SavedViewIn, x_api_token: str | None = Header
 
 
 @app.get("/api/saved-views")
-def api_list_saved_views(x_api_token: str | None = Header(default=None)) -> list[dict[str, Any]]:
-    user = resolve_user(api_token=x_api_token)
+def api_list_saved_views(user: sqlite3.Row | dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
     with connect() as db:
         rows = rows_to_dicts(db.execute("SELECT * FROM saved_views WHERE user_id=? ORDER BY name", (user["id"],)).fetchall())
     for row in rows:
         row["filters"] = decode_json_field(row["filters"], {})
     return rows
+
+
+@app.delete("/api/saved-views/{view_id}", status_code=204)
+def api_delete_saved_view(view_id: int, user: sqlite3.Row | dict[str, Any] = Depends(current_user)) -> Response:
+    with connect() as db:
+        cur = db.execute("DELETE FROM saved_views WHERE id=? AND user_id=?", (view_id, user["id"]))
+        if not cur.rowcount:
+            raise HTTPException(status_code=404, detail="saved view not found")
+    return Response(status_code=204)
 
 
 def representative_links(jurisdiction_code: str) -> list[dict[str, str]]:
@@ -1025,7 +1088,7 @@ def representative_links(jurisdiction_code: str) -> list[dict[str, str]]:
 
 
 @app.get("/api/representatives/links")
-def api_representative_links(jurisdiction: str = "US") -> list[dict[str, str]]:
+def api_representative_links(jurisdiction: str = Query(default="US", pattern=r"^[A-Za-z]{2}$")) -> list[dict[str, str]]:
     return representative_links(jurisdiction.upper())
 
 
@@ -1036,7 +1099,7 @@ def favicon() -> Response:
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
-    return HTML
+    return APP_HTML
 
 
 HTML = r"""

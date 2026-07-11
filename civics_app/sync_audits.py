@@ -12,8 +12,9 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=25)
     args = parser.parse_args()
     result = {"ok": True, **process_audit_jobs(limit=args.limit)}
+    result["ok"] = result["jobs_failed"] == 0
     print(json.dumps(result, indent=2, sort_keys=True))
-    return 0
+    return 0 if result["ok"] else 1
 
 
 if __name__ == "__main__":

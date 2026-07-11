@@ -1,8 +1,8 @@
-import os
+import json
 
 from fastapi.testclient import TestClient
 
-from civics_app.congress import CongressBill, CongressGovClient, normalize_congress_bill
+from civics_app.congress import CongressGovClient, normalize_congress_bill
 from civics_app.main import app, connect
 
 
@@ -43,12 +43,34 @@ def test_congress_client_requires_api_key(monkeypatch):
     assert client.status()["status"] == "missing_api_key"
 
 
+def test_congress_enrichment_preserves_text_summary_actions_and_redacts_key(monkeypatch):
+    payloads = [
+        {"bills": [SAMPLE_LIST_ITEM]},
+        {"bill": {"title": "Detailed title"}},
+        {"summaries": [{"text": "School meals for students."}]},
+        {"textVersions": [{"formats": [{"type": "Formatted Text", "url": "https://congress.gov/text.htm"}]}]},
+        {"actions": [{"actionDate": "2026-06-18", "text": "Introduced"}],
+         "request": {"url": "https://api.congress.gov/v3/bill?api_key=secret"}},
+    ]
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self): return json.dumps(payloads.pop(0)).encode()
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: Response())
+    enriched = CongressGovClient(api_key="secret", retries=1).fetch_recent_bills(limit=1, enrich=True)[0]
+    assert enriched["summary"] == "School meals for students."
+    assert enriched["text_url"] == "https://congress.gov/text.htm"
+    assert enriched["history"][0]["text"] == "Introduced"
+    assert "secret" not in json.dumps(enriched["raw_payload"])
+
+
 def test_sync_congress_endpoint_records_missing_key_status(tmp_path, monkeypatch):
     monkeypatch.setenv("CIVICS_DB", str(tmp_path / "civics.db"))
     monkeypatch.delenv("CONGRESS_API_KEY", raising=False)
-    client = TestClient(app)
+    monkeypatch.setenv("CIVICS_BOOTSTRAP_ADMIN_TOKEN", "test-admin-secret-at-least-32-bytes")
+    client = TestClient(app, backend_options={"use_uvloop": True})
 
-    response = client.post("/api/admin/sync-congress?limit=2")
+    response = client.post("/api/admin/sync-congress?limit=2", headers={"Authorization": "Bearer test-admin-secret-at-least-32-bytes"})
 
     assert response.status_code == 200
     body = response.json()
@@ -62,13 +84,15 @@ def test_sync_congress_endpoint_records_missing_key_status(tmp_path, monkeypatch
 
 def test_upsert_congress_bills_from_sample(tmp_path, monkeypatch):
     monkeypatch.setenv("CIVICS_DB", str(tmp_path / "civics.db"))
-    client = TestClient(app)
+    monkeypatch.setenv("CIVICS_BOOTSTRAP_ADMIN_TOKEN", "test-admin-secret-at-least-32-bytes")
+    client = TestClient(app, backend_options={"use_uvloop": True})
 
-    response = client.post("/api/admin/sync-congress-sample", json={"bills": [SAMPLE_LIST_ITEM]})
+    headers = {"Authorization": "Bearer test-admin-secret-at-least-32-bytes"}
+    response = client.post("/api/admin/sync-congress-sample", headers=headers, json={"bills": [SAMPLE_LIST_ITEM]})
 
     assert response.status_code == 200
     assert response.json()["bills_upserted"] == 1
-    bills = client.get("/api/bills").json()
+    bills = client.get("/api/bills", headers=headers).json()["items"]
     assert any(b["canonical_key"] == "us-119-hr-123" for b in bills)
     bill = next(b for b in bills if b["canonical_key"] == "us-119-hr-123")
     assert bill["source_name"] == "Congress.gov"

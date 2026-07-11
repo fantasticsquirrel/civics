@@ -1,5 +1,5 @@
 [Unit]
-Description=Sync recent federal bills from Congress.gov into Civics Radar
+Description=Sync %i state bills from LegiScan into Civics Radar
 After=network-online.target civics-api.service
 Wants=network-online.target
 
@@ -8,7 +8,7 @@ Type=oneshot
 WorkingDirectory=/opt/civics
 EnvironmentFile=-/etc/civics.env
 Environment=CIVICS_DB=/opt/civics/data/civics.db
-ExecStart=/opt/civics/.venv/bin/python -m civics_app.sync_congress --limit 25
+ExecStart=/opt/civics/.venv/bin/python -m civics_app.sync_legiscan --state %i --limit 25
 User=civics
 Group=civics
 UMask=0077
